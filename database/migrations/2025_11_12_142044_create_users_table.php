@@ -20,6 +20,7 @@ return new class extends Migration
             $table->string('address')->nullable();
             $table->string('vehicle')->nullable();
             $table->boolean('email_notifications')->default(true);
+            $table->timestamp('email_verified_at')->nullable();
             $table->boolean('sms_notifications')->default(false);
             $table->boolean('push_notifications')->default(true);
             $table->boolean('two_factor')->default(false);
