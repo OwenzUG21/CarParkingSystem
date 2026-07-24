@@ -12,13 +12,24 @@ async function handleLogin(event) {
         localStorage.removeItem('allBookings');
         localStorage.removeItem('payments');
         
-        // Check if user is admin and redirect to admin dashboard
+        // Redirect based on role
         if (currentUser.is_admin) {
             window.location.href = '/admin';
             return;
         }
+
+        if (currentUser.role === 'lot_manager') {
+            window.location.href = '/manager';
+            return;
+        }
+
+        if (currentUser.role === 'keeper') {
+            window.location.href = '/keeper';
+            return;
+        }
         
         updateUserProfile();
+        startUserChatPolling();
         
         // Check if user was trying to book a parking spot before login
         if (selectedParking && !document.getElementById('detailsModal').classList.contains('active')) {
@@ -37,7 +48,9 @@ async function handleLogin(event) {
         
         const reservations = await fetchReservations();
         userReservations.length = 0;
-        userReservations.push(...reservations);
+        userReservations.push(...reservations.map(r => normalizeReservation(r)));
+        // Update statuses immediately after fetching
+        updateBookingStatuses();
         
     } catch (error) {
         showDialog('Login failed: ' + error.message, 'error');
@@ -60,6 +73,7 @@ async function handleSignup(event) {
         localStorage.removeItem('payments');
         updateUserProfile();
         showDashboard();
+        startUserChatPolling();
         
         // Fetch initial data
         const locations = await fetchParkingLocations();
@@ -75,9 +89,14 @@ async function handleSignup(event) {
 // Store pending booking details
 let pendingBooking = null;
 
-// Update your confirmBooking function - now it goes to payment first
+// Update your confirmBooking function - book first, pay later
 async function confirmBooking(event) {
     event.preventDefault();
+
+    if (!selectedParking || selectedParking.available <= 0) {
+        showDialog('No parking slots available for this location right now.', 'info', 'Fully Booked');
+        return;
+    }
     
     const date = document.getElementById('bookingDate').value;
     const startTime = document.getElementById('startTime').value;
@@ -91,24 +110,47 @@ async function confirmBooking(event) {
     const fees = amount * 0.2;
     const total = amount + fees;
     
-    // Store booking details for after payment
-    pendingBooking = {
-        parking_location_id: selectedParking.id,
-        date: date,
-        start_time: startTime,
-        end_time: endTime,
-        license_plate: vehicle,
-        total_amount: amount,
-        amount: amount,
-        fees: fees,
-        total: total,
-        hours: hours,
-        parking: selectedParking
-    };
-    
-    // Close booking modal and go to payment page
-    closeBookingModal();
-    showPayments();
+    try {
+        const reservationData = {
+            parking_location_id: selectedParking.id,
+            date: date,
+            start_time: startTime,
+            end_time: endTime,
+            license_plate: vehicle,
+            total_amount: amount,
+            amount: amount
+        };
+
+        const reservation = await createReservation(reservationData);
+        const normalizedReservation = normalizeReservation(reservation);
+        // Ensure status is 'upcoming' for new reservations (don't let frontend override backend status)
+        if (normalizedReservation.status !== 'upcoming' && normalizedReservation.status !== 'active') {
+            normalizedReservation.status = 'upcoming';
+        }
+        userReservations.push(normalizedReservation);
+        
+        // Immediately update status based on current time (in case booking is for current time)
+        updateBookingStatuses();
+
+        const bookedLocation = parkingLocations.find(loc => loc.id === selectedParking.id);
+        if (bookedLocation && bookedLocation.available > 0) {
+            bookedLocation.available -= 1;
+        }
+        if (selectedParking && selectedParking.available > 0) {
+            selectedParking.available -= 1;
+        }
+        displayParkingLocations();
+
+        closeBookingModal();
+        showDialog(
+            `Reservation created!\n\nYou have 20 minutes to complete payment.\n\nParking: ${selectedParking.name}\nDate: ${date}\nTime: ${startTime} - ${endTime}\nAmount: UGX ${total.toFixed(2)}`,
+            'success',
+            'Reservation Confirmed'
+        );
+        showReservations();
+    } catch (error) {
+        showDialog('Booking failed: ' + error.message, 'error');
+    }
 }
 
 // Update your saveAccountSettings function
@@ -178,6 +220,14 @@ async function cancelReservation(id) {
             const reservation = userReservations.find(r => r.id === id);
             if (reservation) {
                 reservation.status = 'cancelled';
+                const locationId = reservation.parking_location_id || reservation.parking?.id || reservation.parking_location?.id;
+                if (locationId) {
+                    const lot = parkingLocations.find(loc => loc.id === locationId);
+                    if (lot) {
+                        lot.available = Math.min(lot.available + 1, lot.total);
+                        displayParkingLocations();
+                    }
+                }
                 displayReservations();
             }
         } catch (error) {
@@ -280,6 +330,13 @@ let userReservations = [];
 let userPayments = [];
 let selectedParking = null;
 let currentReservationFilter = 'active';
+let chatPollInterval = null;
+let chatSeenMessageIds = new Set();
+let tawkMessagesEl = null;
+let tawkInputEl = null;
+let tawkSendEl = null;
+const localChatStorageKey = 'chatHistory';
+const PAYMENT_WINDOW_MINUTES = 20;
 
 function clearAuthState() {
     currentUser = null;
@@ -291,7 +348,129 @@ function clearAuthState() {
     localStorage.removeItem('allBookings');
     localStorage.removeItem('payments');
     localStorage.removeItem('isAdmin');
+    stopUserChatPolling();
+    chatSeenMessageIds.clear();
     updateUserProfileSection();
+}
+
+function formatChatTimestamp(value) {
+    if (!value) {
+        const now = new Date();
+        return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+        return value;
+    }
+    return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function appendChatMessage(text, isUser, timestamp) {
+    if (!tawkMessagesEl) return;
+    const wrapper = document.createElement('div');
+    wrapper.className = `tawk-message ${isUser ? 'user' : 'bot'}`;
+
+    if (!isUser) {
+        const avatar = document.createElement('span');
+        avatar.className = 'tawk-avatar';
+        avatar.textContent = 'P';
+        wrapper.appendChild(avatar);
+    }
+
+    const bubble = document.createElement('div');
+    bubble.className = 'tawk-bubble';
+    bubble.textContent = text;
+
+    const meta = document.createElement('span');
+    meta.className = 'tawk-meta';
+    meta.textContent = formatChatTimestamp(timestamp);
+    bubble.appendChild(meta);
+
+    if (isUser) {
+        const status = document.createElement('span');
+        status.className = 'tawk-status';
+        status.textContent = 'OK';
+        bubble.appendChild(status);
+    }
+
+    wrapper.appendChild(bubble);
+    tawkMessagesEl.appendChild(wrapper);
+    tawkMessagesEl.scrollTop = tawkMessagesEl.scrollHeight;
+}
+
+async function loadUserChatHistory() {
+    if (!currentUser || !tawkMessagesEl) return;
+    try {
+        const messages = await fetchUserChatMessages();
+        const sorted = messages.slice().sort((a, b) => {
+            const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+            const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+            return aTime - bTime;
+        });
+        chatSeenMessageIds.clear();
+        tawkMessagesEl.innerHTML = '';
+        sorted.forEach((message) => {
+            if (!message.id) return;
+            chatSeenMessageIds.add(message.id);
+            const isUser = message.sender_role !== 'admin';
+            appendChatMessage(message.message || '', isUser, message.created_at);
+        });
+    } catch (error) {
+        console.error('Failed to load chat history:', error);
+    }
+}
+
+async function pollUserChatMessages() {
+    if (!currentUser) return;
+    try {
+        const messages = await fetchUserChatMessages();
+        messages.forEach((message) => {
+            if (!message.id || chatSeenMessageIds.has(message.id)) return;
+            chatSeenMessageIds.add(message.id);
+            const isUser = message.sender_role !== 'admin';
+            appendChatMessage(message.message || '', isUser, message.created_at);
+        });
+    } catch (error) {
+        console.error('Failed to load chat messages:', error);
+    }
+}
+
+function startUserChatPolling() {
+    stopUserChatPolling();
+    loadUserChatHistory();
+    chatPollInterval = setInterval(pollUserChatMessages, 10000);
+}
+
+function stopUserChatPolling() {
+    if (chatPollInterval) {
+        clearInterval(chatPollInterval);
+        chatPollInterval = null;
+    }
+}
+
+function loadLocalChatHistory() {
+    if (currentUser || !tawkMessagesEl) return;
+    try {
+        const stored = JSON.parse(localStorage.getItem(localChatStorageKey) || '[]');
+        tawkMessagesEl.innerHTML = '';
+        stored.forEach((message) => {
+            const isUser = message.sender_role !== 'admin';
+            appendChatMessage(message.message || '', isUser, message.created_at);
+        });
+    } catch (error) {
+        console.error('Failed to load local chat history:', error);
+    }
+}
+
+function saveLocalChatMessage(message) {
+    if (currentUser) return;
+    try {
+        const stored = JSON.parse(localStorage.getItem(localChatStorageKey) || '[]');
+        stored.push(message);
+        localStorage.setItem(localChatStorageKey, JSON.stringify(stored));
+    } catch (error) {
+        console.error('Failed to save local chat history:', error);
+    }
 }
 
 // Initialize on page load
@@ -300,8 +479,20 @@ document.addEventListener('DOMContentLoaded', function() {
     initializeApp();
     loadDarkMode();
     renderNotifications();
+    const redirectToFindParking = localStorage.getItem('redirectToFindParking');
+    if (redirectToFindParking) {
+        localStorage.removeItem('redirectToFindParking');
+        showDashboard();
+    }
     const notificationToggle = document.getElementById('notificationToggle');
     const profileToggle = document.getElementById('profileToggle');
+    const mobileMenuToggle = document.getElementById('mobileMenuToggle');
+    const tawkButton = document.getElementById('tawkButton');
+    const tawkPanel = document.getElementById('tawkPanel');
+    const tawkClose = document.getElementById('tawkClose');
+    tawkMessagesEl = document.getElementById('tawkMessages');
+    tawkInputEl = document.getElementById('tawkInput');
+    tawkSendEl = document.getElementById('tawkSend');
     if (notificationToggle) {
         notificationToggle.addEventListener('click', (event) => {
             event.stopPropagation();
@@ -314,8 +505,78 @@ document.addEventListener('DOMContentLoaded', function() {
             toggleDropdown('profileMenu', 'profileToggle');
         });
     }
+    if (mobileMenuToggle) {
+        mobileMenuToggle.addEventListener('click', (event) => {
+            event.stopPropagation();
+            toggleDropdown('mobileMenu', 'mobileMenuToggle');
+        });
+    }
+    if (tawkButton && tawkPanel) {
+        tawkButton.addEventListener('click', (event) => {
+            event.stopPropagation();
+            tawkPanel.classList.toggle('open');
+            tawkPanel.setAttribute('aria-hidden', tawkPanel.classList.contains('open') ? 'false' : 'true');
+        });
+    }
+    if (tawkClose && tawkPanel) {
+        tawkClose.addEventListener('click', (event) => {
+            event.stopPropagation();
+            tawkPanel.classList.remove('open');
+            tawkPanel.setAttribute('aria-hidden', 'true');
+        });
+    }
+    if (tawkPanel) {
+        tawkPanel.addEventListener('click', (event) => {
+            event.stopPropagation();
+        });
+    }
+    if (tawkSendEl && tawkInputEl && tawkMessagesEl) {
+        const sendMessage = async () => {
+            const message = tawkInputEl.value.trim();
+            if (!message) return;
+            const meta = { name: currentUser?.name || 'Guest' };
+            if (currentUser?.email) {
+                meta.email = currentUser.email;
+            }
+            try {
+                const sentMessage = await sendChatMessage(message, meta);
+                if (sentMessage?.id) {
+                    chatSeenMessageIds.add(sentMessage.id);
+                }
+                appendChatMessage(sentMessage?.message || message, true, sentMessage?.created_at);
+                if (!currentUser) {
+                    saveLocalChatMessage({
+                        message: sentMessage?.message || message,
+                        sender_role: 'user',
+                        created_at: sentMessage?.created_at || new Date().toISOString(),
+                    });
+                }
+                tawkInputEl.value = '';
+            } catch (error) {
+                console.error('Chat send failed:', error);
+                const details = error?.message ? ` ${error.message}` : '';
+                showDialog(`Message failed to send.${details}`, 'error', 'Chat Error');
+            }
+        };
+
+        tawkSendEl.addEventListener('click', (event) => {
+            event.stopPropagation();
+            sendMessage();
+        });
+
+        tawkInputEl.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                sendMessage();
+            }
+        });
+    }
     document.addEventListener('click', () => {
         closeAllDropdowns();
+        if (tawkPanel) {
+            tawkPanel.classList.remove('open');
+            tawkPanel.setAttribute('aria-hidden', 'true');
+        }
     });
     document.querySelectorAll('.dropdown-menu').forEach(menu => {
         menu.addEventListener('click', (event) => {
@@ -337,6 +598,7 @@ async function initializeApp() {
             
             // Load data from backend
             await loadBackendData();
+            startUserChatPolling();
         } catch (error) {
             console.error('Token invalid, clearing storage:', error);
             clearAuthState();
@@ -346,6 +608,7 @@ async function initializeApp() {
         clearAuthState();
         // Load parking locations even if not logged in
         loadParkingLocations();
+        loadLocalChatHistory();
     }
 }
 
@@ -382,6 +645,8 @@ async function loadBackendData() {
             userReservations.length = 0;
             // Normalize all reservations from backend
             userReservations.push(...reservations.map(r => normalizeReservation(r)));
+            // Immediately update statuses based on current time
+            updateBookingStatuses();
         }
         
         // Load payment history from database
@@ -467,7 +732,7 @@ function showReservations() {
     displayReservations();
 }
 
-function showPayments() {
+async function showPayments() {
     // Check if user is logged in
     if (!currentUser) {
         showDialog('Please login to view your payments', 'info', 'Login Required');
@@ -479,12 +744,14 @@ function showPayments() {
     document.getElementById('paymentsContent').classList.add('active');
     updateNavLinks('Payments');
     
-    // If there's a pending booking, show payment form, otherwise show history
+    // If there's a pending booking, show payment form, otherwise hide it
     if (pendingBooking) {
         displayPayments();
     } else {
-        displayPaymentHistory();
+        hidePaymentCheckout();
     }
+
+    await updatePaymentsDashboard();
 }
 
 function hideAllPages() {
@@ -525,6 +792,9 @@ function updateUserProfile() {
     
     // Update the profile section
     updateUserProfileSection();
+    if (document.getElementById('profileContent')?.classList.contains('active')) {
+        loadProfile();
+    }
 }
 
 function showSettings() {
@@ -544,14 +814,19 @@ function showSettings() {
 function loadSettings() {
     // Load account details
     if (currentUser) {
-        document.getElementById('settingName').value = currentUser.name || '';
-        document.getElementById('settingEmail').value = currentUser.email || '';
-        document.getElementById('settingPhone').value = currentUser.phone || '';
-        document.getElementById('settingAddress').value = currentUser.address || '';
-        
-        // Update default vehicle
-        if (currentUser.vehicle) {
-            document.getElementById('defaultVehicle').textContent = currentUser.vehicle;
+        const settingName = document.getElementById('settingName');
+        const settingEmail = document.getElementById('settingEmail');
+        const settingPhone = document.getElementById('settingPhone');
+        const settingAddress = document.getElementById('settingAddress');
+        const defaultVehicle = document.getElementById('defaultVehicle');
+
+        if (settingName) settingName.value = currentUser.name || '';
+        if (settingEmail) settingEmail.value = currentUser.email || '';
+        if (settingPhone) settingPhone.value = currentUser.phone || '';
+        if (settingAddress) settingAddress.value = currentUser.address || '';
+
+        if (currentUser.vehicle && defaultVehicle) {
+            defaultVehicle.textContent = currentUser.vehicle;
         }
     }
     
@@ -559,17 +834,22 @@ function loadSettings() {
     const emailNotif = localStorage.getItem('emailNotifications') !== 'false';
     const smsNotif = localStorage.getItem('smsNotifications') === 'true';
     const pushNotif = localStorage.getItem('pushNotifications') !== 'false';
-    
-    document.getElementById('emailNotifications').checked = emailNotif;
-    document.getElementById('smsNotifications').checked = smsNotif;
-    document.getElementById('pushNotifications').checked = pushNotif;
+    const emailEl = document.getElementById('emailNotifications');
+    const smsEl = document.getElementById('smsNotifications');
+    const pushEl = document.getElementById('pushNotifications');
+
+    if (emailEl) emailEl.checked = emailNotif;
+    if (smsEl) smsEl.checked = smsNotif;
+    if (pushEl) pushEl.checked = pushNotif;
     
     // Load security settings
     const twoFactor = localStorage.getItem('twoFactor') === 'true';
     const shareLocation = localStorage.getItem('shareLocation') !== 'false';
-    
-    document.getElementById('twoFactor').checked = twoFactor;
-    document.getElementById('shareLocation').checked = shareLocation;
+    const twoFactorEl = document.getElementById('twoFactor');
+    const shareLocationEl = document.getElementById('shareLocation');
+
+    if (twoFactorEl) twoFactorEl.checked = twoFactor;
+    if (shareLocationEl) shareLocationEl.checked = shareLocation;
     
     // Load theme color
     const themeColor = localStorage.getItem('themeColor') || 'primary';
@@ -582,22 +862,24 @@ function loadSettings() {
 }
 
 function saveNotificationSettings() {
-    const emailNotif = document.getElementById('emailNotifications').checked;
-    const smsNotif = document.getElementById('smsNotifications').checked;
-    const pushNotif = document.getElementById('pushNotifications').checked;
-    
-    localStorage.setItem('emailNotifications', emailNotif);
-    localStorage.setItem('smsNotifications', smsNotif);
-    localStorage.setItem('pushNotifications', pushNotif);
+    const emailEl = document.getElementById('emailNotifications');
+    const smsEl = document.getElementById('smsNotifications');
+    const pushEl = document.getElementById('pushNotifications');
+
+    if (emailEl) localStorage.setItem('emailNotifications', emailEl.checked);
+    if (smsEl) localStorage.setItem('smsNotifications', smsEl.checked);
+    if (pushEl) localStorage.setItem('pushNotifications', pushEl.checked);
 }
 
 function saveSecuritySettings() {
-    const twoFactor = document.getElementById('twoFactor').checked;
-    const shareLocation = document.getElementById('shareLocation').checked;
-    
-    localStorage.setItem('twoFactor', twoFactor);
-    localStorage.setItem('shareLocation', shareLocation);
-    
+    const twoFactorEl = document.getElementById('twoFactor');
+    const shareLocationEl = document.getElementById('shareLocation');
+    const twoFactor = twoFactorEl ? twoFactorEl.checked : false;
+    const shareLocation = shareLocationEl ? shareLocationEl.checked : false;
+
+    if (twoFactorEl) localStorage.setItem('twoFactor', twoFactor);
+    if (shareLocationEl) localStorage.setItem('shareLocation', shareLocation);
+
     if (twoFactor) {
         showDialog('Two-factor authentication enabled. You will receive a verification code on your next login.', 'success', '2FA Enabled');
     }
@@ -656,13 +938,31 @@ function toggleDarkMode() {
     localStorage.setItem('darkMode', isDark);
 }
 
+function applyThemeMode(mode) {
+    const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const useDark = mode === 'dark' || (mode === 'system' && prefersDark);
+    document.body.classList.toggle('dark-mode', useDark);
+    const toggle = document.getElementById('darkModeToggle');
+    if (toggle) toggle.checked = useDark;
+}
+
+function setThemeMode(mode) {
+    localStorage.setItem('themeMode', mode);
+    applyThemeMode(mode);
+}
+
 // Load dark mode preference and theme color
 function loadDarkMode() {
-    const isDark = localStorage.getItem('darkMode') === 'true';
-    if (isDark) {
-        document.body.classList.add('dark-mode');
-        const toggle = document.getElementById('darkModeToggle');
-        if (toggle) toggle.checked = true;
+    const themeMode = localStorage.getItem('themeMode');
+    if (themeMode) {
+        applyThemeMode(themeMode);
+    } else {
+        const isDark = localStorage.getItem('darkMode') === 'true';
+        if (isDark) {
+            document.body.classList.add('dark-mode');
+            const toggle = document.getElementById('darkModeToggle');
+            if (toggle) toggle.checked = true;
+        }
     }
     
     // Load theme color
@@ -670,6 +970,15 @@ function loadDarkMode() {
     if (themeColor) {
         changeThemeColor(themeColor);
     }
+}
+
+if (window.matchMedia) {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+        const themeMode = localStorage.getItem('themeMode');
+        if (themeMode === 'system') {
+            applyThemeMode('system');
+        }
+    });
 }
 
 // Location Functions
@@ -711,6 +1020,9 @@ function updateUserProfileSection() {
     const userEmail = document.getElementById('userEmail');
     const profileLoginItem = document.getElementById('profileLoginItem');
     const profileLogoutItem = document.getElementById('profileLogoutItem');
+    const navLoginButton = document.getElementById('navLoginButton');
+    const notificationWrapper = document.getElementById('notificationWrapper');
+    const profileWrapper = document.getElementById('profileWrapper');
     
     if (currentUser) {
         // User is logged in - show their info
@@ -719,6 +1031,9 @@ function updateUserProfileSection() {
         userAvatar.textContent = (currentUser.name || 'U').charAt(0).toUpperCase();
         if (profileLoginItem) profileLoginItem.style.display = 'none';
         if (profileLogoutItem) profileLogoutItem.style.display = 'flex';
+        if (navLoginButton) navLoginButton.style.display = 'none';
+        if (notificationWrapper) notificationWrapper.style.display = '';
+        if (profileWrapper) profileWrapper.style.display = '';
     } else {
         // User is not logged in - show login prompt
         userName.textContent = 'Guest User';
@@ -726,7 +1041,44 @@ function updateUserProfileSection() {
         userAvatar.textContent = 'G';
         if (profileLoginItem) profileLoginItem.style.display = 'flex';
         if (profileLogoutItem) profileLogoutItem.style.display = 'none';
+        if (navLoginButton) navLoginButton.style.display = 'inline-flex';
+        if (notificationWrapper) notificationWrapper.style.display = 'none';
+        if (profileWrapper) profileWrapper.style.display = 'none';
     }
+}
+
+function showProfile() {
+    if (!currentUser) {
+        showDialog('Please login to access your profile', 'info', 'Login Required');
+        showLogin();
+        return;
+    }
+    hideAllDashboardContent();
+    const profileContent = document.getElementById('profileContent');
+    if (profileContent) {
+        profileContent.classList.add('active');
+    }
+    updateNavLinks('Profile');
+    loadProfile();
+}
+
+function loadProfile() {
+    if (!currentUser) return;
+    const profileName = document.getElementById('profileName');
+    const profileEmail = document.getElementById('profileEmail');
+    const profileAvatar = document.getElementById('profileAvatar');
+    const settingName = document.getElementById('settingName');
+    const settingEmail = document.getElementById('settingEmail');
+    const settingPhone = document.getElementById('settingPhone');
+    const settingAddress = document.getElementById('settingAddress');
+
+    if (profileName) profileName.textContent = currentUser.name || 'User';
+    if (profileEmail) profileEmail.textContent = currentUser.email || '';
+    if (profileAvatar) profileAvatar.textContent = (currentUser.name || 'U').charAt(0).toUpperCase();
+    if (settingName) settingName.value = currentUser.name || '';
+    if (settingEmail) settingEmail.value = currentUser.email || '';
+    if (settingPhone) settingPhone.value = currentUser.phone || '';
+    if (settingAddress) settingAddress.value = currentUser.address || '';
 }
 
 // Notification UI
@@ -829,9 +1181,9 @@ function createParkingCard(parking) {
     card.className = 'parking-card';
     card.onclick = () => showParkingDetails(parking);
     
-    const availabilityPercent = (parking.available / parking.total) * 100;
-    const statusClass = availabilityPercent > 30 ? 'available' : 'limited';
-    const statusText = availabilityPercent > 30 ? 'Available' : 'Limited';
+    const availabilityPercent = parking.total ? (parking.available / parking.total) * 100 : 0;
+    const statusClass = parking.available <= 0 ? 'unavailable' : availabilityPercent >= 20 ? 'available' : 'limited';
+    const statusText = parking.available <= 0 ? 'Unavailable' : availabilityPercent >= 20 ? 'Available' : 'Limited';
     
     card.innerHTML = `
         <div class="parking-image" style="background-image: url('${parking.image}'); background-size: cover; background-position: center;">
@@ -886,6 +1238,10 @@ function showParkingDetails(parking) {
     
     if (!modal || !content) return;
     
+    const availabilityPercent = parking.total ? (parking.available / parking.total) * 100 : 0;
+    const isUnavailable = parking.available <= 0;
+    const availabilityLabel = isUnavailable ? 'Unavailable' : availabilityPercent >= 20 ? 'Available' : 'Limited';
+
     content.innerHTML = `
         <div class="modal-header">
             <h2 class="modal-title">${parking.name}</h2>
@@ -926,7 +1282,7 @@ function showParkingDetails(parking) {
             <h3 style="margin-bottom: 1rem;">Features</h3>
             <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
                 ${parking.features.map(feature => 
-                    `<span style="padding: 0.5rem 1rem; background: var(--light); border-radius: 20px; font-size: 0.9rem;">
+                    `<span class="feature-tag">
                         ✓ ${feature}
                     </span>`
                 ).join('')}
@@ -937,9 +1293,10 @@ function showParkingDetails(parking) {
             <button class="modal-btn btn-secondary" onclick="openGoogleMaps(${parking.lat}, ${parking.lng})">
                 Get Directions
             </button>
-            <button class="modal-btn btn-primary" onclick="openBookingModal()">
-                Book Now
+            <button class="modal-btn btn-primary" onclick="openBookingModal()" ${isUnavailable ? 'disabled' : ''}>
+                ${isUnavailable ? 'No Slots Available' : 'Book Now'}
             </button>
+            <span style="margin-left:auto; font-size:0.9rem; color:var(--gray);">${availabilityLabel}</span>
         </div>
     `;
     
@@ -960,6 +1317,10 @@ function openGoogleMaps(lat, lng) {
 
 // Booking Functions
 function openBookingModal() {
+    if (selectedParking && selectedParking.available <= 0) {
+        showDialog('No parking slots available for this location right now.', 'info', 'Fully Booked');
+        return;
+    }
     closeModal();
     const modal = document.getElementById('bookingModal');
     const content = document.getElementById('bookingContent');
@@ -1065,232 +1426,414 @@ function calculatePrice() {
     }
 }
 
+function calculateHours(startTime, endTime) {
+    if (!startTime || !endTime) return 0;
+    const parseTime = (value) => {
+        const trimmed = String(value).trim();
+        const parts = trimmed.split(':');
+        if (parts.length < 2) return null;
+        const hours = Number(parts[0]);
+        const minutes = Number(parts[1]);
+        if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+        if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+        return hours * 60 + minutes;
+    };
+    const startMinutes = parseTime(startTime);
+    const endMinutes = parseTime(endTime);
+    if (startMinutes === null || endMinutes === null) return 0;
+    const diffMinutes = endMinutes - startMinutes;
+    return diffMinutes > 0 ? diffMinutes / 60 : 0;
+}
+
+// Parse reservation date to YYYY-MM-DD (handles API formats: string, object, Date)
+function parseReservationDate(dateVal) {
+    if (!dateVal) return null;
+    
+    // Handle string formats: "2025-02-19", "2025-02-19T00:00:00.000000Z", "2025-02-19 00:00:00"
+    if (typeof dateVal === 'string') {
+        // Extract date part before T or space
+        const datePart = dateVal.split('T')[0].split(' ')[0];
+        // Validate format YYYY-MM-DD
+        if (/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+            return datePart;
+        }
+    }
+    
+    // Handle Date objects
+    if (dateVal instanceof Date) {
+        const y = dateVal.getFullYear();
+        const m = String(dateVal.getMonth() + 1).padStart(2, '0');
+        const d = String(dateVal.getDate()).padStart(2, '0');
+        return `${y}-${m}-${d}`;
+    }
+    
+    // Handle Laravel Carbon serialized objects: {date: "2025-02-19 00:00:00", timezone_type: 3, timezone: "UTC"}
+    if (typeof dateVal === 'object' && dateVal !== null) {
+        if (dateVal.date) {
+            const datePart = String(dateVal.date).split('T')[0].split(' ')[0];
+            if (/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+                return datePart;
+            }
+        }
+        // Try to extract from any string property
+        for (let key in dateVal) {
+            if (typeof dateVal[key] === 'string' && /^\d{4}-\d{2}-\d{2}/.test(dateVal[key])) {
+                return dateVal[key].split('T')[0].split(' ')[0];
+            }
+        }
+    }
+    
+    return null;
+}
+
+// Parse time string to HH:MM (handles "11:27", "11:27:00", "11:27:00.000000")
+function parseReservationTime(timeStr) {
+    if (!timeStr) return null;
+    const parts = String(timeStr).split(':');
+    if (parts.length >= 2) {
+        return `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
+    }
+    return null;
+}
+
+// Create Date in LOCAL time - avoids timezone confusion
+function reservationToLocalDate(dateStr, timeStr) {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const timeParts = String(timeStr || '').split(':').map(function(x) { return parseInt(x, 10) || 0; });
+    const h = timeParts[0] || 0;
+    const min = timeParts[1] || 0;
+    const sec = timeParts[2] || 0;
+    return new Date(y, m - 1, d, h, min, sec);
+}
+
 // Auto-update booking statuses based on current time
 function updateBookingStatuses() {
     const now = new Date();
     let updated = false;
     
+    if (!Array.isArray(userReservations) || userReservations.length === 0) return;
+    
     userReservations.forEach(r => {
+        try {
         const reservation = normalizeReservation(r);
-        if (!reservation.date) return;
         
-        // Skip if already cancelled
-        if (reservation.status === 'cancelled') {
-            if (r.status !== 'cancelled') {
-                r.status = 'cancelled';
-                updated = true;
-            }
+        // Skip if already cancelled or completed (from backend - don't override)
+        if (r.status === 'cancelled') return;
+        if (r.status === 'completed') return;
+
+        // Get raw date value - could be string, Date object, or object with date property
+        const rawDate = reservation.date || r.date;
+        const dateStr = parseReservationDate(rawDate);
+        const startTimeStr = parseReservationTime(reservation.startTime || reservation.start_time || r.startTime || r.start_time);
+        const endTimeStr = parseReservationTime(reservation.endTime || reservation.end_time || r.endTime || r.end_time);
+        
+        if (!dateStr || !startTimeStr || !endTimeStr) {
             return;
         }
         
-        const startTime = reservation.startTime || reservation.start_time || '';
-        const endTime = reservation.endTime || reservation.end_time || '';
-        
-        if (!startTime || !endTime) {
+        // Validate date format
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
             return;
         }
 
-        // Parse date and time - handle both date-only and datetime strings
+        // Use explicit local time construction (avoids timezone issues)
+        // startTimeStr/endTimeStr are "HH:MM" - append :00 if needed for seconds
         let startDateTime, endDateTime;
         try {
-            // Get just the date part (handle both "2024-01-01" and "2024-01-01T10:00:00" formats)
-            const dateStr = reservation.date.split('T')[0];
-            
-            // Ensure time is in HH:MM format
-            const startTimeStr = startTime.length === 5 ? startTime : startTime.substring(0, 5);
-            const endTimeStr = endTime.length === 5 ? endTime : endTime.substring(0, 5);
-            
-            startDateTime = new Date(`${dateStr}T${startTimeStr}`);
-            endDateTime = new Date(`${dateStr}T${endTimeStr}`);
-            
-            // Validate dates
+            const startFull = startTimeStr.split(':').length >= 3 ? startTimeStr : startTimeStr + ':00';
+            const endFull = endTimeStr.split(':').length >= 3 ? endTimeStr : endTimeStr + ':00';
+            startDateTime = reservationToLocalDate(dateStr, startFull);
+            endDateTime = reservationToLocalDate(dateStr, endFull);
             if (isNaN(startDateTime.getTime()) || isNaN(endDateTime.getTime())) {
-                console.warn('Invalid date/time for reservation:', reservation.id, dateStr, startTimeStr, endTimeStr);
-                return; // Invalid dates, skip
+                return;
             }
         } catch (e) {
-            console.warn('Error parsing date/time for reservation:', reservation.id, e);
-            return; // Error parsing, skip
+            return;
         }
-
-        // Determine new status based on current time
+        
+        const nowTime = now.getTime();
+        const startTimeMs = startDateTime.getTime();
+        const endTimeMs = endDateTime.getTime();
+        
+        // Determine status based on current time
         let newStatus;
-        if (now < startDateTime) {
-            // Reservation hasn't started yet
+        if (nowTime < startTimeMs) {
             newStatus = 'upcoming';
-        } else if (now >= startDateTime && now < endDateTime) {
-            // Reservation is currently active
+        } else if (nowTime >= startTimeMs && nowTime < endTimeMs) {
             newStatus = 'active';
-        } else if (now >= endDateTime) {
-            // Reservation has ended
+        } else {
             newStatus = 'completed';
         }
         
-        // Update status if it changed
         if (r.status !== newStatus) {
             r.status = newStatus;
             updated = true;
         }
+        } catch (err) {
+            console.error('Error updating reservation status:', r?.id, err);
+        }
     });
     
     if (updated) {
-        saveToLocalStorage();
+        try {
+            saveToLocalStorage();
+            // Re-render reservations view so user sees upcoming → active transition
+            const reservationsContent = document.getElementById('reservationsContent');
+            if (reservationsContent && reservationsContent.classList.contains('active')) {
+                const activeTab = document.querySelector('.reservations-tab.active');
+                const currentFilter = activeTab?.getAttribute('data-filter') || 'active';
+                // Only refresh if we're on the reservations page
+                displayReservations(currentFilter);
+            }
+        } catch (err) {
+            console.error('Error updating reservations display:', err);
+        }
     }
 }
 
 // Display Functions
 function displayReservations(filter = 'active') {
-    const container = document.getElementById('reservationsList');
-    if (!container) return;
+    const activeList = document.getElementById('reservationsActiveList');
+    const upcomingList = document.getElementById('reservationsUpcomingList');
+    const historyBody = document.getElementById('reservationsHistoryBody');
+    const summaryEl = document.getElementById('reservationsSummary');
+    const activeCountEl = document.getElementById('reservationsActiveCount');
+    const upcomingCountEl = document.getElementById('reservationsUpcomingCount');
+    const historyCountEl = document.getElementById('reservationsHistoryCount');
 
-    // Update statuses before filtering
+    if (!activeList || !upcomingList || !historyBody) return;
+
+    // Always update statuses before displaying (ensures fresh status)
     updateBookingStatuses();
 
-    // Filter reservations - use the actual status from the reservation object
-    let filteredReservations = [];
-    switch (filter) {
-        case 'past':
-            filteredReservations = userReservations.filter(r => {
-                // Use the status directly from r (which was updated by updateBookingStatuses)
-                const status = r.status || normalizeReservation(r).status;
-                return status === 'completed' || status === 'cancelled';
-            });
-            break;
-        case 'cancelled':
-            filteredReservations = userReservations.filter(r => {
-                const status = r.status || normalizeReservation(r).status;
-                return status === 'cancelled';
-            });
-            break;
-        default:
-            // Default shows both upcoming and active
-            filteredReservations = userReservations.filter(r => {
-                const status = r.status || normalizeReservation(r).status;
-                return status === 'active' || status === 'upcoming';
-            });
+    const normalized = userReservations.map(r => normalizeReservation(r));
+    const active = normalized.filter(r => r.status === 'active');
+    const upcoming = normalized.filter(r => r.status === 'upcoming');
+    const history = normalized.filter(r => r.status === 'completed' || r.status === 'cancelled');
+
+    if (summaryEl) {
+        if (active.length === 0 && upcoming.length === 0) {
+            summaryEl.textContent = 'No active or upcoming reservations right now.';
+        } else {
+            summaryEl.textContent = `You have ${active.length} active and ${upcoming.length} upcoming parking sessions.`;
+        }
     }
 
-    // No reservations
-    if (filteredReservations.length === 0) {
-        container.innerHTML = `
-            <div style="text-align:center; padding:4rem; color:var(--gray);">
-                <p style="font-size:3rem;">🚗</p>
-                <h3>No ${filter === 'past' ? 'Past' : filter === 'cancelled' ? 'Canceled' : 'Active'} Bookings</h3>
-                <p>Book a parking spot to see it here.</p>
-            </div>`;
+    if (activeCountEl) activeCountEl.textContent = active.length;
+    if (upcomingCountEl) upcomingCountEl.textContent = upcoming.length;
+    if (historyCountEl) historyCountEl.textContent = history.length;
+
+    activeList.innerHTML = active.length
+        ? active.map(r => renderReservationCard(r, 'active')).join('')
+        : '<div class="reservation-empty">No active sessions.</div>';
+
+    upcomingList.innerHTML = upcoming.length
+        ? upcoming.map(r => renderReservationCard(r, 'upcoming')).join('')
+        : '<div class="reservation-empty">No upcoming reservations.</div>';
+
+    historyBody.innerHTML = history.length
+        ? history.map(r => renderHistoryRow(r)).join('')
+        : '<tr><td colspan="6">No past reservations yet.</td></tr>';
+
+    const activeSection = document.getElementById('reservationsActiveSection');
+    const upcomingSection = document.getElementById('reservationsUpcomingSection');
+    const historySection = document.getElementById('reservationsHistorySection');
+
+    if (activeSection && upcomingSection && historySection) {
+        activeSection.style.display = filter === 'active' ? 'flex' : 'none';
+        upcomingSection.style.display = filter === 'upcoming' ? 'flex' : 'none';
+        historySection.style.display = filter === 'history' ? 'flex' : 'none';
+    }
+}
+
+function getPaymentInfo(reservation) {
+    const payment = reservation.payment || reservation.payment_data || null;
+    const status = (payment?.status || '').toLowerCase();
+    if (status === 'completed') {
+        return { status: 'paid', label: 'Paid' };
+    }
+    if (status === 'failed') {
+        if (reservation.status === 'cancelled') {
+            return { status: 'expired', label: 'Payment expired' };
+        }
+        return { status: 'failed', label: 'Payment failed' };
+    }
+    return { status: 'pending', label: 'Payment pending' };
+}
+
+function beginReservationPayment(reservationId) {
+    const reservation = normalizeReservation(userReservations.find(r => r.id === reservationId));
+    if (!reservation) {
+        showDialog('Reservation not found.', 'error');
         return;
     }
 
-    // Build reservation cards
-    container.innerHTML = filteredReservations.map(r => {
-        // Normalize reservation data
-        const reservation = normalizeReservation(r);
-        
-        const isPast = reservation.status === 'completed';
-        const isCanceled = reservation.status === 'cancelled';
-        const statusColor =
-            reservation.status === 'active' ? 'var(--success)' :
-            reservation.status === 'upcoming' ? 'var(--warning)' :
-            isCanceled ? 'var(--danger)' : 'var(--gray)';
-        const statusBg =
-            reservation.status === 'active' ? 'rgba(16,185,129,0.1)' :
-            reservation.status === 'upcoming' ? 'rgba(245,158,11,0.15)' :
-            isCanceled ? 'rgba(239,68,68,0.15)' : 'rgba(100,116,139,0.15)';
-        const qrId = `qr-${reservation.id}`;
-        const barcodeId = `barcode-${reservation.id}`;
-        
-        // Get parking name and address
-        const parkingName = reservation.parking?.name || reservation.parking_location?.name || reservation.parkingLocation?.name || 'Unknown Parking';
-        const parkingAddress = reservation.parking?.address || reservation.parking_location?.address || reservation.parkingLocation?.address || '';
-        
-        // Get time values
-        const startTime = reservation.startTime || reservation.start_time || 'N/A';
-        const endTime = reservation.endTime || reservation.end_time || 'N/A';
-        const date = reservation.date || 'N/A';
-        const vehicle = reservation.vehicle || reservation.license_plate || 'N/A';
-        const amount = reservation.amount || reservation.total_amount || 0;
+    if (reservation.status === 'cancelled' || reservation.status === 'completed') {
+        showDialog('This reservation is no longer eligible for payment.', 'info');
+        return;
+    }
 
-        return `
-        <div class="reservation-card" style="
-            background: var(--light);
-            padding: 1.5rem;
-            border-radius: 1rem;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-            margin-bottom: 1.5rem;
-            border: 1px solid var(--border);
-            opacity: ${isPast ? 0.8 : 1};
-            transition: all 0.3s ease;
-        ">
-            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                <div>
-                    <h3 style="font-size:1.1rem; font-weight:700; color:var(--dark);">${parkingName}</h3>
-                    <p style="font-size:0.9rem; color:var(--gray);">${parkingAddress}</p>
-                </div>
-                <span style="
-                    background:${statusBg};
-                    color:${statusColor};
-                    font-weight:600;
-                    border-radius:20px;
-                    padding:0.3rem 0.8rem;
-                    font-size:0.8rem;">
-                    ${reservation.status.toUpperCase()}
-                </span>
-            </div>
+    const paymentInfo = getPaymentInfo(reservation);
+    if (paymentInfo.status === 'paid') {
+        showDialog('This reservation is already paid.', 'info');
+        return;
+    }
+    if (paymentInfo.status === 'expired') {
+        showDialog('Payment window expired. Please book again.', 'warning');
+        return;
+    }
 
-            <div style="border-top:1px solid var(--border); margin-top:1rem; padding-top:1rem;
-                display:grid; grid-template-columns:1fr 1fr; gap:0.5rem; color:var(--gray); font-size:0.9rem;">
-                <div>📅 ${date}</div>
-                <div>⏰ ${startTime} - ${endTime}</div>
-                <div>🚗 ${vehicle}</div>
-                <div>💰 UGX ${(parseFloat(amount)).toFixed(2)}</div>
-            </div>
+    const parking = reservation.parking
+        || parkingLocations.find(loc => loc.id === reservation.parking_location_id)
+        || { name: 'Parking', address: '', price: 0 };
+    const startTime = reservation.startTime || reservation.start_time || '';
+    const endTime = reservation.endTime || reservation.end_time || '';
+    const hours = calculateHours(startTime, endTime);
+    const rawAmount = Number(reservation.amount || reservation.total_amount || 0);
+    const subtotal = Math.max(0, Math.abs(rawAmount));
+    const fees = subtotal * 0.2;
+    const total = subtotal + fees;
 
-            <div class="ticket-section">
-                <div class="qr-wrapper">
-                    <div id="${qrId}" class="qr-box"></div>
-                    <p class="qr-label">Scan Entry</p>
-                </div>
+    pendingBooking = {
+        reservation_id: reservation.id,
+        parking_location_id: reservation.parking_location_id || parking.id,
+        date: reservation.date,
+        start_time: startTime,
+        end_time: endTime,
+        license_plate: reservation.vehicle || reservation.license_plate || '',
+        total_amount: subtotal,
+        amount: subtotal,
+        fees: fees,
+        total: total,
+            hours: hours,
+        parking: parking,
+        created_at: reservation.created_at
+    };
 
-                <div class="barcode-wrapper">
-                    <svg id="${barcodeId}" class="barcode"></svg>
-                    <p class="booking-code">${reservation.bookingCode || "PKE" + reservation.id}</p>
-                    <p class="booking-label">Booking ID</p>
-                </div>
-            </div>
-
-            <div style="margin-top:1rem; display:flex; justify-content:flex-end; gap:0.5rem;">
-                ${!isPast && !isCanceled ? `
-                    <button onclick="cancelReservation(${reservation.id})"
-                        style="background:rgba(239,68,68,0.1); color:var(--danger);
-                        border:none; border-radius:8px; padding:0.5rem 1rem; cursor:pointer; font-weight:600;">
-                        Cancel
-                    </button>
-                ` : ''}
-                ${isPast ? `
-                    <button onclick="printReservation(${reservation.id})"
-                        style="background:var(--primary); color:white; border:none; border-radius:8px; padding:0.5rem 1rem; cursor:pointer; font-weight:600;">
-                        View Receipt
-                    </button>
-                ` : `
-                    <button onclick="printReservation(${reservation.id})"
-                        style="background:var(--primary); color:white; border:none; border-radius:8px; padding:0.5rem 1rem; cursor:pointer; font-weight:600;">
-                        Print
-                    </button>
-                `}
-            </div>
-        </div>`;
-    }).join('');
-
-    // Generate barcodes & QR codes
-    filteredReservations.forEach(r => {
-        const reservation = normalizeReservation(r);
-        const parkingName = reservation.parking?.name || reservation.parking_location?.name || reservation.parkingLocation?.name || 'Parking';
-        generateBarcode(reservation.id);
-        generateQRCode(reservation.id, `PKE${reservation.id}-${parkingName}`);
-    });
+    showPayments();
 }
 
-// Normalize reservation data to handle both frontend and backend formats
+function renderReservationCard(reservation, type) {
+    const parkingName = reservation.parking?.name || 'Unknown Parking';
+    const parkingAddress = reservation.parking?.address || '';
+    const vehicle = reservation.vehicle || reservation.license_plate || 'Not set';
+    const date = reservation.date || 'N/A';
+    const startTime = reservation.startTime || reservation.start_time || 'N/A';
+    const endTime = reservation.endTime || reservation.end_time || 'N/A';
+    const amount = reservation.amount || reservation.total_amount || 0;
+    const image = reservation.parking?.image || '';
+    const duration = getReservationDuration(reservation);
+    const statusClass = reservation.status || type;
+    const statusLabel = reservation.status ? reservation.status.toUpperCase() : type.toUpperCase();
+    const passId = `reservation-pass-${reservation.id}`;
+    const paymentInfo = getPaymentInfo(reservation);
+    const showPayButton = paymentInfo.status === 'pending' && reservation.status !== 'cancelled';
+    const paymentBadgeClass = paymentInfo.status === 'paid' ? 'paid' : paymentInfo.status === 'expired' ? 'expired' : 'pending';
+
+    return `
+        <div class="reservation-card-modern">
+            <div class="reservation-card-image" style="${image ? `background-image:url('${image}'); background-size:cover; background-position:center;` : ''}">
+                <span>${reservation.id ? `RES-${reservation.id}` : 'RESERVATION'}</span>
+            </div>
+            <div class="reservation-card-body">
+                <div class="reservation-card-title">
+                    <div>
+                        <div class="reservation-meta">${vehicle}</div>
+                        <h4>${parkingName}</h4>
+                        <div class="reservation-meta">${parkingAddress}</div>
+                    </div>
+                    <div>
+                        <span class="reservation-status ${statusClass}">${statusLabel}</span>
+                        <div class="reservation-payment ${paymentBadgeClass}">${paymentInfo.label}</div>
+                        <div class="reservation-meta" style="text-align:right; margin-top:6px;">${formatUGX(amount)}</div>
+                    </div>
+                </div>
+                <div class="reservation-details">
+                    <div><strong>Date</strong>${date}</div>
+                    <div><strong>Time</strong>${startTime} - ${endTime}</div>
+                    <div><strong>Duration</strong>${duration}</div>
+                    <div><strong>Vehicle</strong>${vehicle}</div>
+                    <div><strong>Payment</strong>${paymentInfo.label}</div>
+                </div>
+                <div class="reservation-actions">
+                    <button class="primary" type="button" onclick="toggleReservationPass(${reservation.id})">View Pass</button>
+                    <button type="button" onclick="printReservation(${reservation.id})">Print</button>
+                    ${showPayButton ? `<button class="primary" type="button" onclick="beginReservationPayment(${reservation.id})">Pay Now</button>` : ''}
+                    ${type === 'active' ? `<button class="danger" type="button" onclick="cancelReservation(${reservation.id})">End Session</button>` : ''}
+                    ${type === 'upcoming' ? `<button class="danger" type="button" onclick="cancelReservation(${reservation.id})">Cancel</button>` : ''}
+                </div>
+                <div class="reservation-pass" id="${passId}">
+                    <div id="qr-${reservation.id}"></div>
+                    <div class="reservation-pass-meta">
+                        <div><strong>Pass ID</strong> ${reservation.id ? `PKE${reservation.id}` : 'N/A'}</div>
+                        <div>Show this QR code at entry.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function renderHistoryRow(reservation) {
+    const parkingName = reservation.parking?.name || 'Unknown Parking';
+    const date = reservation.date || 'N/A';
+    const amount = reservation.amount || reservation.total_amount || 0;
+    const duration = getReservationDuration(reservation);
+    const status = reservation.status || 'completed';
+    const paymentInfo = getPaymentInfo(reservation);
+    const statusLabel = paymentInfo.status === 'expired' ? 'PAYMENT EXPIRED' : status.toUpperCase();
+    const statusClass = paymentInfo.status === 'expired' ? 'payment-expired' : status;
+
+    return `
+        <tr>
+            <td>
+                <div class="reservation-meta" style="font-weight:700; color:#111827;">${parkingName}</div>
+                <div class="reservation-meta">${reservation.vehicle || reservation.license_plate || 'Not set'}</div>
+            </td>
+            <td>${date}</td>
+            <td>${duration}</td>
+            <td style="font-weight:700;">${formatUGX(amount)}</td>
+            <td>
+                <span class="reservation-status-pill ${statusClass}"><span></span>${statusLabel}</span>
+            </td>
+            <td style="text-align:right;">
+                <button class="reservations-link" type="button" onclick="printReservation(${reservation.id})">Print</button>
+            </td>
+        </tr>
+    `;
+}
+
+function getReservationDuration(reservation) {
+    const start = reservation.startTime || reservation.start_time;
+    const end = reservation.endTime || reservation.end_time;
+    if (!start || !end) return 'N/A';
+
+    const startDate = new Date(`2000-01-01T${start}`);
+    const endDate = new Date(`2000-01-01T${end}`);
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return 'N/A';
+
+    const diffMs = endDate - startDate;
+    if (diffMs <= 0) return 'N/A';
+
+    const totalMinutes = Math.round(diffMs / 60000);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return `${hours}h ${minutes}m`;
+}
+
+function toggleReservationPass(reservationId) {
+    const pass = document.getElementById(`reservation-pass-${reservationId}`);
+    if (!pass) return;
+
+    const isActive = pass.classList.contains('active');
+    document.querySelectorAll('.reservation-pass').forEach(panel => panel.classList.remove('active'));
+
+    if (!isActive) {
+        pass.classList.add('active');
+        generateQRCode(reservationId, `PKE${reservationId}`);
+    }
+}
+
 function normalizeReservation(reservation) {
     if (!reservation) return reservation;
     
@@ -1310,6 +1853,9 @@ function normalizeReservation(reservation) {
     // Normalize amount
     const amount = data.amount || data.total_amount || 0;
     
+    // Preserve backend status - don't default to 'completed'
+    const status = data.status || 'upcoming';
+    
     return {
         ...data,
         id: data.id,
@@ -1325,19 +1871,16 @@ function normalizeReservation(reservation) {
         amount: amount,
         total_amount: amount,
         date: data.date || '',
-        status: data.status || 'upcoming'
+        status: status // Use preserved status, default to 'upcoming' if missing
     };
 }
 
 function filterReservations(filterType) {
-    document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-    const activeBtn = [...document.querySelectorAll('.tab-btn')]
-        .find(b => b.textContent.toLowerCase().includes(filterType));
+    document.querySelectorAll('.reservations-tab').forEach(btn => btn.classList.remove('active'));
+    const activeBtn = document.querySelector(`.reservations-tab[data-filter="${filterType}"]`);
     if (activeBtn) activeBtn.classList.add('active');
     displayReservations(filterType);
 }
-
-// Generate barcode using SVG
 function generateBarcode(reservationId) {
     const barcodeElement = document.getElementById(`barcode-${reservationId}`);
     if (!barcodeElement) return;
@@ -1580,33 +2123,40 @@ function printReservation(reservationId) {
 }
 
 function displayPayments() {
-    const container = document.getElementById('paymentArea');
+    const container = document.getElementById('paymentCheckout');
     if (!container) return;
     
-    // Check if there's a pending booking, otherwise show payment history
     if (!pendingBooking) {
-        displayPaymentHistory();
+        hidePaymentCheckout();
         return;
     }
+
+    togglePaymentsBilling(false);
+    container.style.display = 'block';
     
     // Use pending booking data
     const booking = pendingBooking;
+    const isExistingReservation = !!booking.reservation_id;
     const hours = booking.hours || 2;
-    const subtotal = booking.amount || (hours * booking.parking.price);
+    const parkingName = booking.parking?.name || 'Parking';
+    const parkingAddress = booking.parking?.address || '';
+    const parkingRate = Number(booking.parking?.price || 0);
+    const rawAmount = booking.amount || (hours * parkingRate);
+    const subtotal = Math.max(0, Math.abs(Number(rawAmount || 0)));
     const fees = booking.fees || (subtotal * 0.2);
     const total = booking.total || (subtotal + fees);
     
     container.innerHTML = `
         <div class="payment-container">
             <div class="payment-summary-card">
-                <h2>Booking Summary</h2>
+                <h2>${isExistingReservation ? 'Reservation Summary' : 'Booking Summary'}</h2>
                 <div class="summary-item">
                     <span class="label">Location</span>
-                    <span class="value">${booking.parking.name}</span>
+                    <span class="value">${parkingName}</span>
                 </div>
                 <div class="summary-item">
                     <span class="label">Address</span>
-                    <span class="value">${booking.parking.address}</span>
+                    <span class="value">${parkingAddress}</span>
                 </div>
                 <div class="summary-item">
                     <span class="label">Date</span>
@@ -1622,7 +2172,7 @@ function displayPayments() {
                 </div>
                 <div class="divider"></div>
                 <div class="summary-item">
-                    <span class="label">Subtotal (${hours.toFixed(1)} hrs @ ${booking.parking.price}/hr)</span>
+                    <span class="label">Subtotal (${hours.toFixed(1)} hrs @ ${parkingRate}/hr)</span>
                     <span class="value">UGX ${subtotal.toFixed(2)}</span>
                 </div>
                 <div class="summary-item">
@@ -1640,37 +2190,30 @@ function displayPayments() {
                 <h2>Payment Details</h2>
                 
                 <div class="payment-methods">
-                    <button class="payment-method active" data-method="Mobile Payment">
-                        <span>📱</span>
-                        <span>Mobile Payment</span>
+                    <button class="payment-method active" data-method="Mobile Money">
+                        <span>Mobile Money</span>
                     </button>
-                    <button class="payment-method" data-method="Card">
-                        <span>💳</span>
-                        <span>Card</span>
+                    <button class="payment-method" data-method="Visa Card">
+                        <span>Visa Card</span>
                     </button>
-                    <button class="payment-method" data-method="PayPal">
-                        <span>🅿️</span>
-                        <span>PayPal</span>
-                    </button>
-                    <button class="payment-method" data-method="Google Pay">
-                        <span>🔵</span>
-                        <span>Google Pay</span>
+                    <button class="payment-method" data-method="Mastercard">
+                        <span>Mastercard</span>
                     </button>
                 </div>
+
+                <div class="payment-method-label" id="paymentMethodLabel">Mobile Money</div>
                 
                 <form class="payment-form" onsubmit="processPayment(event)" id="paymentForm">
                     <div id="mobilePaymentFields">
                         <div class="form-group">
                             <label>Phone Number</label>
                             <div class="input-with-icon">
-                                <span class="icon">📱</span>
                                 <input type="tel" placeholder="+256 700 000 000" required id="phoneNumber">
                             </div>
                         </div>
                         <div class="form-group">
                             <label>Mobile Money Provider</label>
                             <div class="input-with-icon">
-                                <span class="icon">💰</span>
                                 <select required id="mobileProvider" style="width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: white;">
                                     <option value="">Select Provider</option>
                                     <option value="MTN Mobile Money">MTN Mobile Money</option>
@@ -1685,7 +2228,7 @@ function displayPayments() {
                         <div class="form-group">
                             <label>Name on Card</label>
                             <div class="input-with-icon">
-                                <span class="icon">👤</span>
+                                <span class="icon">NAME</span>
                                 <input type="text" placeholder="John M. Doe" id="cardName">
                             </div>
                         </div>
@@ -1693,9 +2236,8 @@ function displayPayments() {
                         <div class="form-group">
                             <label>Card Number</label>
                             <div class="input-with-icon">
-                                <span class="icon">💳</span>
+                                <span class="icon">CARD</span>
                                 <input type="text" placeholder="0000 0000 0000 0000" id="cardNumber">
-                                <span class="icon-right">✓</span>
                             </div>
                         </div>
                         
@@ -1703,14 +2245,14 @@ function displayPayments() {
                             <div class="form-group">
                                 <label>Expiration Date</label>
                                 <div class="input-with-icon">
-                                    <span class="icon">📅</span>
+                                    <span class="icon">EXP</span>
                                     <input type="text" placeholder="MM/YY" id="cardExpiry">
                                 </div>
                             </div>
                             <div class="form-group">
                                 <label>CVV</label>
                                 <div class="input-with-icon">
-                                    <span class="icon">🔒</span>
+                                    <span class="icon">CVV</span>
                                     <input type="text" placeholder="123" id="cardCVV">
                                 </div>
                             </div>
@@ -1723,18 +2265,27 @@ function displayPayments() {
                     </div>
                     
                     <button type="submit" class="pay-btn">
-                        <span>🔒</span>
-                        <span>Pay UGX ${total.toFixed(2)} & Confirm Booking</span>
+                        <span>Pay UGX ${total.toFixed(2)}</span>
                     </button>
                     
                     <div class="secure-note">
-                        <span>🛡️</span>
+                        <span>Secure</span>
                         <span>Your payment information is encrypted and secure</span>
                     </div>
                 </form>
             </div>
         </div>
     `;
+
+    const lastMobile = userPayments.find(p => (p.method || '').toLowerCase().includes('mobile'));
+    const phoneInput = document.getElementById('phoneNumber');
+    const providerSelect = document.getElementById('mobileProvider');
+    if (phoneInput && !phoneInput.value) {
+        phoneInput.value = (lastMobile && lastMobile.phone) || currentUser?.phone || '';
+    }
+    if (providerSelect && lastMobile && lastMobile.provider) {
+        providerSelect.value = lastMobile.provider;
+    }
     
     // Setup payment method switching after form is rendered
     setTimeout(() => {
@@ -1753,7 +2304,12 @@ function displayPayments() {
                     const mobileFields = document.getElementById('mobilePaymentFields');
                     const cardFields = document.getElementById('cardPaymentFields');
                     
-                    if (method === 'Mobile Payment') {
+                    const methodLabel = document.getElementById('paymentMethodLabel');
+                    if (methodLabel) {
+                        methodLabel.textContent = method;
+                    }
+
+                    if (method === 'Mobile Money') {
                         if (mobileFields) mobileFields.style.display = 'block';
                         if (cardFields) cardFields.style.display = 'none';
                         // Make mobile fields required, card fields not required
@@ -1792,6 +2348,344 @@ function displayPayments() {
     }, 100);
 }
 
+function hidePaymentCheckout() {
+    const container = document.getElementById('paymentCheckout');
+    if (!container) return;
+    container.style.display = 'none';
+    container.innerHTML = '';
+}
+
+function togglePaymentsBilling(showBilling) {
+    const billing = document.getElementById('paymentsBilling');
+    if (!billing) return;
+    billing.style.display = showBilling ? 'block' : 'none';
+}
+
+function formatUGX(amount) {
+    const value = Number(amount || 0);
+    return `UGX ${value.toFixed(2)}`;
+}
+
+function parsePaymentDate(payment) {
+    const date = payment.date || '';
+    const time = payment.time || '00:00';
+    const parsed = new Date(`${date}T${time}`);
+    return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+function getActiveReservationSummary() {
+    if (!Array.isArray(userReservations) || userReservations.length === 0) {
+        return null;
+    }
+
+    const active = userReservations
+        .map(r => normalizeReservation(r))
+        .filter(r => r.status === 'active' || r.status === 'upcoming');
+
+    if (active.length === 0) return null;
+
+    active.sort((a, b) => {
+        const aDate = new Date(a.date || 0);
+        const bDate = new Date(b.date || 0);
+        return aDate - bDate;
+    });
+
+    return active[0];
+}
+
+function updatePaymentsStats() {
+    const totalEl = document.getElementById('paymentsTotalSpent');
+    const trendEl = document.getElementById('paymentsTotalTrend');
+    const activeEl = document.getElementById('paymentsActiveCost');
+    const activeMetaEl = document.getElementById('paymentsActiveMeta');
+    const pendingEl = document.getElementById('paymentsPendingTotal');
+    const pendingMetaEl = document.getElementById('paymentsPendingMeta');
+
+    if (!totalEl || !trendEl || !activeEl || !activeMetaEl || !pendingEl || !pendingMetaEl) {
+        return;
+    }
+
+    const now = new Date();
+    const currentStart = new Date();
+    currentStart.setDate(now.getDate() - 30);
+    const previousStart = new Date();
+    previousStart.setDate(now.getDate() - 60);
+
+    const completedPayments = userPayments.filter(p => (p.status || '').toLowerCase() === 'completed');
+    const currentTotal = completedPayments
+        .filter(p => parsePaymentDate(p) >= currentStart)
+        .reduce((sum, p) => sum + Number(p.amount || 0), 0);
+
+    const previousTotal = completedPayments
+        .filter(p => {
+            const date = parsePaymentDate(p);
+            return date >= previousStart && date < currentStart;
+        })
+        .reduce((sum, p) => sum + Number(p.amount || 0), 0);
+
+    let change = 0;
+    if (previousTotal > 0) {
+        change = ((currentTotal - previousTotal) / previousTotal) * 100;
+    } else if (currentTotal > 0) {
+        change = 100;
+    }
+
+    totalEl.textContent = formatUGX(currentTotal);
+    trendEl.textContent = `${Math.round(change)}% from last month`;
+
+    if (pendingBooking) {
+        activeEl.textContent = formatUGX(pendingBooking.total_amount || pendingBooking.total || 0);
+        activeMetaEl.textContent = pendingBooking.parking?.name || 'Pending booking';
+    } else {
+        const activeReservation = getActiveReservationSummary();
+        if (activeReservation) {
+            activeEl.textContent = formatUGX(activeReservation.amount || 0);
+            activeMetaEl.textContent = activeReservation.parking?.name || 'Active reservation';
+        } else {
+            activeEl.textContent = formatUGX(0);
+            activeMetaEl.textContent = 'No active session';
+        }
+    }
+
+    const pendingTotal = userPayments
+        .filter(p => (p.status || '').toLowerCase() === 'pending')
+        .reduce((sum, p) => sum + Number(p.amount || 0), 0);
+
+    pendingEl.textContent = formatUGX(pendingTotal);
+    pendingMetaEl.textContent = pendingTotal > 0 ? 'Pending payments' : 'All clear for now';
+}
+
+function updatePaymentMethods() {
+    const grid = document.getElementById('paymentMethodsGrid');
+    if (!grid) return;
+
+    const sorted = [...userPayments].sort((a, b) => parsePaymentDate(b) - parsePaymentDate(a));
+    const latestByType = {};
+
+    sorted.forEach(payment => {
+        const method = (payment.method || '').toLowerCase();
+        const provider = (payment.provider || '').toLowerCase();
+        if (!latestByType.mobile && (method.includes('mobile money') || method.includes('mobile payment'))) {
+            latestByType.mobile = payment;
+        }
+        if (!latestByType.airtel && (provider.includes('airtel') || method.includes('airtel'))) {
+            latestByType.airtel = payment;
+        }
+        if (!latestByType.mtn && (provider.includes('mtn') || method.includes('mtn'))) {
+            latestByType.mtn = payment;
+        }
+        if (!latestByType.visa && method.includes('visa')) {
+            latestByType.visa = payment;
+        }
+        if (!latestByType.mastercard && method.includes('mastercard')) {
+            latestByType.mastercard = payment;
+        }
+        if (!latestByType.card && method === 'card') {
+            latestByType.card = payment;
+        }
+    });
+
+    const cards = [];
+
+    if (latestByType.visa) {
+        cards.push(`
+            <div class="payment-card visa">
+                <div class="payment-card-top">
+                    <span class="chip"></span>
+                    <span class="brand">VISA</span>
+                </div>
+                <div class="payment-card-number">**** **** **** ${latestByType.visa.cardLast4 || '----'}</div>
+                <div class="payment-card-bottom">
+                    <div>
+                        <p class="label">Card Holder</p>
+                        <p>${currentUser?.name || 'Card Holder'}</p>
+                    </div>
+                    <div>
+                        <p class="label">Expires</p>
+                        <p>--/--</p>
+                    </div>
+                </div>
+            </div>
+        `);
+    }
+
+    if (latestByType.mastercard) {
+        cards.push(`
+            <div class="payment-card master">
+                <div class="payment-card-top">
+                    <span class="chip"></span>
+                    <span class="brand">
+                        <span class="dot red"></span>
+                        <span class="dot yellow"></span>
+                    </span>
+                </div>
+                <div class="payment-card-number">**** **** **** ${latestByType.mastercard.cardLast4 || '----'}</div>
+                <div class="payment-card-bottom">
+                    <div>
+                        <p class="label">Card Holder</p>
+                        <p>${currentUser?.name || 'Card Holder'}</p>
+                    </div>
+                    <div>
+                        <p class="label">Expires</p>
+                        <p>--/--</p>
+                    </div>
+                </div>
+            </div>
+        `);
+    }
+
+    if (latestByType.airtel) {
+        const label = `${latestByType.airtel.phone || ''} ${latestByType.airtel.provider || 'Airtel'}`.trim();
+        cards.push(`
+            <div class="payment-card airtel">
+                <div class="payment-card-top">
+                    <span class="chip"></span>
+                    <span class="brand">AIRTEL</span>
+                </div>
+                <div class="payment-card-number">${label || 'Mobile Money'}</div>
+                <div class="payment-card-bottom">
+                    <div>
+                        <p class="label">Account</p>
+                        <p>${label || 'Airtel Money'}</p>
+                    </div>
+                    <div>
+                        <p class="label">Type</p>
+                        <p>Mobile</p>
+                    </div>
+                </div>
+            </div>
+        `);
+    }
+
+    if (latestByType.mtn) {
+        const label = `${latestByType.mtn.phone || ''} ${latestByType.mtn.provider || 'MTN'}`.trim();
+        cards.push(`
+            <div class="payment-card mtn">
+                <div class="payment-card-top">
+                    <span class="chip"></span>
+                    <span class="brand">MTN</span>
+                </div>
+                <div class="payment-card-number">${label || 'Mobile Money'}</div>
+                <div class="payment-card-bottom">
+                    <div>
+                        <p class="label">Account</p>
+                        <p>${label || 'MTN Mobile Money'}</p>
+                    </div>
+                    <div>
+                        <p class="label">Type</p>
+                        <p>Mobile</p>
+                    </div>
+                </div>
+            </div>
+        `);
+    }
+
+    if (!latestByType.visa && !latestByType.mastercard && latestByType.card) {
+        cards.push(`
+            <div class="payment-card visa">
+                <div class="payment-card-top">
+                    <span class="chip"></span>
+                    <span class="brand">CARD</span>
+                </div>
+                <div class="payment-card-number">**** **** **** ${latestByType.card.cardLast4 || '----'}</div>
+                <div class="payment-card-bottom">
+                    <div>
+                        <p class="label">Card Holder</p>
+                        <p>${currentUser?.name || 'Card Holder'}</p>
+                    </div>
+                    <div>
+                        <p class="label">Expires</p>
+                        <p>--/--</p>
+                    </div>
+                </div>
+            </div>
+        `);
+    }
+
+    const mobilePayment = latestByType.mobile;
+    cards.push(`
+        <div class="payment-card wallet">
+            <div class="wallet-icon">MOBILE</div>
+            <p class="wallet-title">${mobilePayment ? 'Mobile Money Connected' : 'Add Mobile Money'}</p>
+            <p class="wallet-subtitle">${mobilePayment ? `${mobilePayment.phone || ''} ${mobilePayment.provider || ''}`.trim() : 'Select a provider during payment'}</p>
+            <button class="wallet-btn" type="button">Manage</button>
+        </div>
+    `);
+
+    if (cards.length === 1) {
+        cards.unshift(`
+            <div class="payment-card wallet">
+                <div class="wallet-icon">CARD</div>
+                <p class="wallet-title">Add Visa or Mastercard</p>
+                <p class="wallet-subtitle">Add a card during payment</p>
+                <button class="wallet-btn" type="button">Add</button>
+            </div>
+        `);
+    }
+
+    grid.innerHTML = cards.join('');
+}
+
+function updatePaymentHistoryTable() {
+    const body = document.getElementById('paymentsTableBody');
+    const countText = document.getElementById('paymentsCountText');
+
+    if (!body || !countText) return;
+
+    if (!userPayments || userPayments.length === 0) {
+        body.innerHTML = `
+            <tr>
+                <td colspan="7">No transactions yet.</td>
+            </tr>
+        `;
+        countText.textContent = 'Showing 0 of 0 transactions';
+        return;
+    }
+
+    const sortedPayments = [...userPayments].sort((a, b) => parsePaymentDate(b) - parsePaymentDate(a));
+    const rows = sortedPayments.map(payment => {
+        const status = (payment.status || 'completed').toLowerCase();
+        const statusLabel = status === 'completed' ? 'Paid' : status === 'failed' ? 'Failed' : 'Pending';
+        const statusClass = status === 'completed' ? 'paid' : status === 'failed' ? 'failed' : 'pending';
+        const dateLabel = payment.date || '';
+        const timeLabel = payment.time || 'N/A';
+        const location = payment.parking || 'Unknown Parking';
+        const receiptText = status === 'failed' ? 'Retry' : 'Download';
+        const receiptClass = status === 'failed' ? 'receipt-btn alt' : 'receipt-btn';
+
+        return `
+            <tr>
+                <td>#PK-${payment.id}</td>
+                <td>
+                    <div>${dateLabel}</div>
+                    <div class="muted">${timeLabel}</div>
+                </td>
+                <td>${location}</td>
+                <td>-</td>
+                <td class="strong">${formatUGX(payment.amount)}</td>
+                <td><span class="status ${statusClass}">${statusLabel}</span></td>
+                <td class="right"><button class="${receiptClass}" type="button">${receiptText}</button></td>
+            </tr>
+        `;
+    }).join('');
+
+    body.innerHTML = rows;
+    countText.textContent = `Showing ${sortedPayments.length} of ${sortedPayments.length} transactions`;
+}
+
+async function updatePaymentsDashboard() {
+    if (pendingBooking) {
+        togglePaymentsBilling(false);
+        return;
+    }
+
+    togglePaymentsBilling(true);
+    await loadPaymentHistory();
+    updatePaymentsStats();
+    updatePaymentMethods();
+    updatePaymentHistoryTable();
+}
+
 async function processPayment(event) {
     event.preventDefault();
     
@@ -1802,13 +2696,13 @@ async function processPayment(event) {
     
     // Get selected payment method
     const activeMethod = document.querySelector('.payment-method.active');
-    const paymentMethod = activeMethod ? activeMethod.getAttribute('data-method') : 'Mobile Payment';
+    const paymentMethod = activeMethod ? activeMethod.getAttribute('data-method') : 'Mobile Money';
     
     // Get payment form data based on method
     const form = event.target;
     let paymentDetails = {};
     
-    if (paymentMethod === 'Mobile Payment') {
+    if (paymentMethod === 'Mobile Money') {
         const phoneNumber = document.getElementById('phoneNumber').value;
         const mobileProvider = document.getElementById('mobileProvider').value;
         paymentDetails = {
@@ -1832,58 +2726,82 @@ async function processPayment(event) {
     
     try {
         // Process payment (simulate payment processing)
-        // In a real app, you would call a payment API here
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate API call
-        
-        // Create reservation after payment is successful
-        const reservationData = {
-            parking_location_id: pendingBooking.parking_location_id,
-            date: pendingBooking.date,
-            start_time: pendingBooking.start_time,
-            end_time: pendingBooking.end_time,
-            license_plate: pendingBooking.license_plate,
-            total_amount: pendingBooking.total_amount,
-            amount: pendingBooking.total_amount,
-            payment_method: paymentMethod,
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        const paymentPayload = {
+            method: paymentMethod,
         };
-        
-        // Add payment-specific details
-        if (paymentMethod === 'Mobile Payment') {
-            reservationData.payment_phone = paymentDetails.phone;
-            reservationData.payment_provider = paymentDetails.provider;
+
+        if (paymentMethod === 'Mobile Money') {
+            paymentPayload.phone = paymentDetails.phone;
+            paymentPayload.provider = paymentDetails.provider;
         } else if (paymentDetails.cardNumber) {
-            reservationData.payment_card_last4 = paymentDetails.cardNumber.slice(-4);
+            paymentPayload.card_last4 = paymentDetails.cardNumber.slice(-4);
         }
-        
-        const reservation = await createReservation(reservationData);
-        
-        // Normalize reservation data from backend
-        const normalizedReservation = normalizeReservation(reservation);
-        
-        // Add reservation to list
-        userReservations.push(normalizedReservation);
-        
-        // Payment is now saved in database via ReservationController
-        // Reload payment history from database
-        await loadPaymentHistory();
-        
-        // Clear pending booking
-        const bookingDetails = { ...pendingBooking };
-        pendingBooking = null;
-        selectedParking = null;
-        
-        // Show success dialog
-        showDialog(
-            `Booking confirmed!\n\nParking: ${bookingDetails.parking.name}\nDate: ${bookingDetails.date}\nTime: ${bookingDetails.start_time} - ${bookingDetails.end_time}\nAmount: UGX ${bookingDetails.total.toFixed(2)}`,
-            'success',
-            'Booking Confirmed'
-        );
-        
-        // Show payment history
-        setTimeout(() => {
-            displayPaymentHistory();
-        }, 500);
-        
+
+        if (pendingBooking.reservation_id) {
+            const response = await payReservation(pendingBooking.reservation_id, paymentPayload);
+            const updatedReservation = normalizeReservation(response.reservation);
+            userReservations = userReservations.map(r => (r.id === updatedReservation.id ? updatedReservation : r));
+
+            await loadPaymentHistory();
+
+            pendingBooking = null;
+            showDialog(
+                `Payment completed!\n\nParking: ${updatedReservation.parking?.name || 'Reservation'}\nAmount: ${formatUGX(updatedReservation.amount || 0)}`,
+                'success',
+                'Payment Confirmed'
+            );
+            showReservations();
+        } else {
+            // Legacy flow (fallback)
+            const reservationData = {
+                parking_location_id: pendingBooking.parking_location_id,
+                date: pendingBooking.date,
+                start_time: pendingBooking.start_time,
+                end_time: pendingBooking.end_time,
+                license_plate: pendingBooking.license_plate,
+                total_amount: pendingBooking.total_amount,
+                amount: pendingBooking.total_amount,
+                payment_method: paymentMethod,
+            };
+
+            if (paymentMethod === 'Mobile Money') {
+                reservationData.payment_phone = paymentDetails.phone;
+                reservationData.payment_provider = paymentDetails.provider;
+            } else if (paymentDetails.cardNumber) {
+                reservationData.payment_card_last4 = paymentDetails.cardNumber.slice(-4);
+            }
+
+            const reservation = await createReservation(reservationData);
+
+            const bookedLocation = parkingLocations.find(loc => loc.id === pendingBooking.parking_location_id);
+            if (bookedLocation && bookedLocation.available > 0) {
+                bookedLocation.available -= 1;
+            }
+            if (selectedParking && selectedParking.id === pendingBooking.parking_location_id && selectedParking.available > 0) {
+                selectedParking.available -= 1;
+            }
+            displayParkingLocations();
+
+            const normalizedReservation = normalizeReservation(reservation);
+            userReservations.push(normalizedReservation);
+            await loadPaymentHistory();
+
+            const bookingDetails = { ...pendingBooking };
+            pendingBooking = null;
+            selectedParking = null;
+
+            showDialog(
+                `Booking confirmed!\n\nParking: ${bookingDetails.parking.name}\nDate: ${bookingDetails.date}\nTime: ${bookingDetails.start_time} - ${bookingDetails.end_time}\nAmount: UGX ${bookingDetails.total.toFixed(2)}`,
+                'success',
+                'Booking Confirmed'
+            );
+
+            setTimeout(() => {
+                displayPaymentHistory();
+            }, 500);
+        }
     } catch (error) {
         showDialog('Payment failed: ' + error.message, 'error');
     }
@@ -2177,59 +3095,19 @@ function clearAllFilters() {
 
 // Add this to the end of your d.js file
 async function displayPaymentHistory() {
-    const container = document.getElementById('paymentArea');
-    if (!container) return;
-    
-    // Load from database first
-    await loadPaymentHistory();
-    
-    if (!userPayments || userPayments.length === 0) {
-        container.innerHTML = `
-            <div style="text-align: center; padding: 4rem; color: var(--gray);">
-                <p style="font-size: 3rem; margin-bottom: 1rem;">💳</p>
-                <h3>No Payment History</h3>
-                <p>Your payment history will appear here after making a payment</p>
-            </div>
-        `;
-        return;
-    }
-    
-    // Sort payments by date (newest first)
-    const sortedPayments = [...userPayments].sort((a, b) => {
-        const dateA = new Date(a.date + ' ' + (a.time || '00:00'));
-        const dateB = new Date(b.date + ' ' + (b.time || '00:00'));
-        return dateB - dateA;
-    });
-    
-    container.innerHTML = `
-        <div class="payment-history-container">
-            <h2 style="margin-bottom: 2rem; color: var(--text-primary);">Payment History</h2>
-            <div class="payment-history-list">
-                ${sortedPayments.map(payment => `
-                    <div class="payment-history-item">
-                        <div class="payment-history-icon">
-                            ${payment.method === 'Mobile Payment' ? '📱' : payment.method === 'Card' ? '💳' : payment.method === 'PayPal' ? '🅿️' : payment.method === 'Google Pay' ? '🔵' : '💰'}
-                        </div>
-                        <div class="payment-history-details">
-                            <div class="payment-history-header">
-                                <h3>${payment.parking || 'Parking Payment'}</h3>
-                                <span class="payment-status ${payment.status}">${payment.status}</span>
-                            </div>
-                            <p class="payment-history-meta">
-                                ${payment.date} at ${payment.time || 'N/A'}
-                                ${payment.method === 'Mobile Payment' && payment.phone ? ` • ${payment.phone} (${payment.provider || ''})` : ''}
-                                ${payment.cardLast4 ? ` • Card ending in ${payment.cardLast4}` : ''}
-                            </p>
-                        </div>
-                        <div class="payment-history-amount">
-                            <span>UGX ${parseFloat(payment.amount).toFixed(2)}</span>
-                        </div>
-                    </div>
-                `).join('')}
-            </div>
-        </div>
-    `;
+    hidePaymentCheckout();
+    await updatePaymentsDashboard();
 }
 
-// Auto-update statuses every minute
-setInterval(() => updateBookingStatuses(), 60 * 1000);
+// Auto-update statuses every 15 seconds (upcoming → active when start time passes)
+// Use try-catch to prevent crashes
+setInterval(() => {
+    try {
+        updateBookingStatuses();
+    } catch (err) {
+        console.error('Error in status update interval:', err);
+    }
+}, 15 * 1000);
+
+
+

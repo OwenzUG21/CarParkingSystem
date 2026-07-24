@@ -23,6 +23,7 @@ class AuthController extends Controller
             'name' => $request->name,
             'email' => $request->email,
             'password' => Hash::make($request->password),
+            'role' => 'user',
         ]);
 
         $token = $user->createToken('auth_token')->plainTextToken;
@@ -31,6 +32,8 @@ class AuthController extends Controller
             'data' => [
                 'user' => $user,
                 'access_token' => $token,
+                'role' => $user->role,
+                'is_admin' => $user->is_admin ?? false,
             ],
             'message' => 'Registration successful'
         ], 201);
@@ -50,6 +53,13 @@ class AuthController extends Controller
         }
 
         $user = User::where('email', $request->email)->firstOrFail();
+
+        if ($user->is_active === false) {
+            throw ValidationException::withMessages([
+                'email' => ['This account is deactivated. Please contact the admin.'],
+            ]);
+        }
+
         $token = $user->createToken('auth_token')->plainTextToken;
 
         return response()->json([
@@ -57,6 +67,7 @@ class AuthController extends Controller
                 'user' => $user,
                 'access_token' => $token,
                 'is_admin' => $user->is_admin ?? false,
+                'role' => $user->role,
             ],
             'message' => 'Login successful'
         ]);
@@ -76,6 +87,7 @@ class AuthController extends Controller
             'data' => [
                 'user' => $user,
                 'is_admin' => $user->is_admin ?? false,
+                'role' => $user->role,
             ]
         ]);
     }

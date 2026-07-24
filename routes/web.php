@@ -9,3 +9,14 @@ Route::get('/', function () {
 Route::get('/admin', function () {
     return view('admin');
 });
+
+// Lot Manager dashboard
+Route::get('/manager', function () {
+    return view('dash');
+});
+
+// Keeper dashboard
+Route::get('/keeper', function () {
+    return view('keeper');
+});
+

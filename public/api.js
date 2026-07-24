@@ -1,5 +1,13 @@
 // api.js - Updated to match Laravel routes
-const API_URL = 'http://localhost:8000/api';
+const API_URL = (function resolveApiUrl() {
+    if (typeof window !== 'undefined') {
+        const base = window.API_BASE_URL || window.location?.origin;
+        if (base && base !== 'null') {
+            return `${base}/api`;
+        }
+    }
+    return 'http://localhost:8000/api';
+})();
 let authToken = localStorage.getItem('authToken') || null;
 
 // Function to update authToken from localStorage
@@ -11,7 +19,6 @@ function updateAuthToken() {
 // API Helper Functions
 async function apiRequest(endpoint, options = {}) {
     const headers = {
-        'Content-Type': 'application/json',
         'Accept': 'application/json',
     };
 
@@ -27,8 +34,20 @@ async function apiRequest(endpoint, options = {}) {
         },
     };
 
-    if (options.body) {
+    // Body handling:
+    // - If body is FormData: do NOT set Content-Type (browser will set boundary)
+    // - Else assume JSON
+    if (options.body instanceof FormData) {
+        config.body = options.body;
+        // Remove any JSON content-type if present
+        if (config.headers && config.headers['Content-Type']) {
+            delete config.headers['Content-Type'];
+        }
+    } else if (options.body !== undefined) {
+        config.headers['Content-Type'] = 'application/json';
         config.body = JSON.stringify(options.body);
+    } else {
+        config.headers['Content-Type'] = 'application/json';
     }
 
     try {
@@ -83,15 +102,23 @@ async function loginUser(email, password) {
     if (data.data && data.data.access_token) {
         authToken = data.data.access_token;
         localStorage.setItem('authToken', authToken);
-        // Store is_admin flag
-        if (data.data.is_admin) {
+
+        const isAdmin = !!data.data.is_admin;
+        const role = data.data.role || data.data.user?.role || 'user';
+
+        // Store flags for role-based dashboards
+        if (isAdmin) {
             localStorage.setItem('isAdmin', 'true');
         } else {
             localStorage.removeItem('isAdmin');
         }
+
+        localStorage.setItem('role', role);
+
         return {
             ...data.data.user,
-            is_admin: data.data.is_admin || false
+            is_admin: isAdmin,
+            role,
         };
     }
     throw new Error('Login failed: No token received');
@@ -176,6 +203,14 @@ async function fetchPayments() {
     return data.data || [];
 }
 
+async function payReservation(reservationId, paymentData) {
+    const data = await apiRequest(`/payments/reservations/${reservationId}`, {
+        method: 'POST',
+        body: paymentData
+    });
+    return data.data;
+}
+
 // Admin API
 async function fetchAllBookings() {
     const data = await apiRequest('/admin/bookings');
@@ -190,6 +225,206 @@ async function fetchAllPayments() {
 async function fetchAdminStats() {
     const data = await apiRequest('/admin/stats');
     return data.data || {};
+}
+
+// Chat API
+async function sendChatMessage(message, meta = {}) {
+    const data = await apiRequest('/chat/messages', {
+        method: 'POST',
+        body: { message, ...meta }
+    });
+    return data.data;
+}
+
+async function fetchUserChatMessages() {
+    const data = await apiRequest('/chat/messages');
+    return data.data || [];
+}
+
+async function fetchAdminChatMessages() {
+    const data = await apiRequest('/admin/chat/messages');
+    return data.data || [];
+}
+
+async function fetchAdminManagers() {
+    const data = await apiRequest('/admin/managers');
+    return data.data || [];
+}
+
+async function createAdminLot(payload) {
+    const data = await apiRequest('/admin/lots', {
+        method: 'POST',
+        body: payload,
+    });
+    return data.data;
+}
+
+async function createAdminManager(payload) {
+    const data = await apiRequest('/admin/managers', {
+        method: 'POST',
+        body: payload,
+    });
+    return data.data;
+}
+
+async function updateAdminManager(id, payload) {
+    const data = await apiRequest(`/admin/managers/${id}`, {
+        method: 'PUT',
+        body: payload,
+    });
+    return data.data;
+}
+
+async function deleteAdminManager(id) {
+    return await apiRequest(`/admin/managers/${id}`, {
+        method: 'DELETE',
+    });
+}
+
+async function fetchAdminLots() {
+    const data = await apiRequest('/admin/lots');
+    return data.data || [];
+}
+
+async function updateAdminLot(id, payload) {
+    const data = await apiRequest(`/admin/lots/${id}`, {
+        method: 'PUT',
+        body: payload,
+    });
+    return data.data || {};
+}
+
+async function deleteAdminLot(id) {
+    return await apiRequest(`/admin/lots/${id}`, {
+        method: 'DELETE',
+    });
+}
+
+// Lot Manager (Spot Admin) API
+async function fetchManagerDashboard() {
+    const data = await apiRequest('/manager/dashboard');
+    return data.data || {};
+}
+
+async function fetchManagerLots() {
+    const data = await apiRequest('/manager/lots');
+    return data.data || [];
+}
+
+async function fetchManagerBookings() {
+    const data = await apiRequest('/manager/bookings');
+    return data.data || [];
+}
+
+async function fetchManagerSlots(lotId) {
+    const data = await apiRequest(`/manager/lots/${lotId}/slots`);
+    return data.data || [];
+}
+
+async function configureManagerSlots(lotId, payload) {
+    const data = await apiRequest(`/manager/lots/${lotId}/slots/configure`, {
+        method: 'POST',
+        body: payload,
+    });
+    return data.data || [];
+}
+
+async function updateManagerLot(lotId, payload) {
+    const isFormData = payload instanceof FormData;
+    if (isFormData && !payload.has('_method')) {
+        payload.append('_method', 'PUT');
+    }
+
+    const data = await apiRequest(`/manager/lots/${lotId}`, {
+        // PHP only parses multipart/form-data for POST; use method spoofing for uploads.
+        method: isFormData ? 'POST' : 'PUT',
+        body: payload,
+    });
+    return data.data || {};
+}
+
+async function fetchManagerActiveBookings(lotId) {
+    const data = await apiRequest(`/manager/lots/${lotId}/bookings/active`);
+    return data.data || [];
+}
+
+async function fetchManagerKeepers() {
+    const data = await apiRequest('/manager/keepers');
+    return data.data || [];
+}
+
+async function createManagerKeeper(payload) {
+    const data = await apiRequest('/manager/keepers', {
+        method: 'POST',
+        body: payload,
+    });
+    return data.data;
+}
+
+async function fetchManagerKeeperActivity() {
+    const data = await apiRequest('/manager/keepers/activity');
+    return data.data || [];
+}
+
+async function updateManagerKeeper(assignmentId, payload) {
+    const data = await apiRequest(`/manager/keepers/${assignmentId}`, {
+        method: 'PUT',
+        body: payload,
+    });
+    return data.data;
+}
+
+async function deleteManagerKeeper(assignmentId) {
+    const data = await apiRequest(`/manager/keepers/${assignmentId}`, {
+        method: 'DELETE',
+    });
+    return data;
+}
+
+async function fetchManagerValidations() {
+    const data = await apiRequest('/manager/validations');
+    return data.data || [];
+}
+
+async function createManagerValidation(payload) {
+    const data = await apiRequest('/manager/validations', {
+        method: 'POST',
+        body: payload,
+    });
+    return data.data;
+}
+
+// Keeper API
+async function fetchKeeperLot() {
+    const data = await apiRequest('/keeper/lot');
+    return data.data || {};
+}
+
+async function fetchKeeperActiveBookings() {
+    const data = await apiRequest('/keeper/bookings/active');
+    return data.data || [];
+}
+
+async function keeperCheckIn(payload) {
+    const data = await apiRequest('/keeper/check-in', {
+        method: 'POST',
+        body: payload,
+    });
+    return data.data;
+}
+
+async function keeperCheckOut(payload) {
+    const data = await apiRequest('/keeper/check-out', {
+        method: 'POST',
+        body: payload,
+    });
+    return data.data;
+}
+
+async function keeperPaymentStatus(licensePlate) {
+    const params = new URLSearchParams({ license_plate: licensePlate });
+    const data = await apiRequest(`/keeper/payment-status?${params.toString()}`);
+    return data.data;
 }
 
 // Check API connection
